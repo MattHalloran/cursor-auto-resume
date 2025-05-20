@@ -1,79 +1,30 @@
-# Cursor Auto Resume
+# CursorAutoHelper
 
-![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
-![Version](https://img.shields.io/badge/Version-1.0.0-green.svg)
+![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)  
+![Version](https://img.shields.io/badge/Version-5.2-green.svg)
 
-A simple tool that automatically clicks the "resume the conversation" link when Cursor IDE hits its API rate limits.
+An in-page helper for Cursor IDE that automates three common disruptions—rate-limit resume, connection retries, and idle cycling—so you can focus on coding uninterrupted.
 
-## Important Note on Usage
+## What It Does
 
-This tool is created with the intention of helping developers maintain their workflow efficiency while using Cursor IDE. It is designed to automate a manual action that Cursor explicitly allows (clicking the "resume conversation" link) and does not attempt to bypass or circumvent any actual rate limits or security measures.
+- **Auto-click Resume**  
+  Detects the “resume the conversation” link after the 25-tool-call limit and clicks it on your behalf (3 s cooldown).
 
-We respect Cursor's services and their need for rate limiting. This tool:
-- Only automates an action that users are explicitly allowed to perform
-- Maintains the same cooldown periods as manual clicking
-- Does not attempt to bypass actual API limits or quotas
-- Simply reduces the manual interruption of having to click the resume link
+- **Auto-retry on Connection Failure**  
+  Watches for “Connection failed.” banners or retry icons, clicks “Try again” (or the retry icon), and uses exponential back-off (1 s → … → 5 min) between attempts.
 
-The goal is to enhance developer productivity while working within Cursor's intended usage patterns.
+- **Idle Detection & Tab-Cycling**  
+  1. After 10 s of no user activity, shows “No activity – waiting 60 s before cycling tabs.”  
+  2. At 30 s before cycling, warns “Cycling tabs in XX s” and briefly outlines the tab list.  
+  3. After sufficient idle time, cycles through selecting each chat tab. This allows the auto-resume and auto-retry to be applied to all chats
 
-## Why This Tool Exists
+- **Element Preview Before Click**  
+  Any automatic click is preceded by a 1 s preview outline (magenta border) so you can see what’s being activated.
 
-When using Cursor's AI features extensively during development, you often hit rate limits after about 25 tool calls. Normally, you'd see a message like this:
-
-```
-Note: we default stop the agent after 25 tool calls. You can resume the conversation.
-```
-
-This tool automatically detects this message and clicks the "resume the conversation" link for you, allowing you to maintain focus on your development tasks without manual interruption.
-
-## Features
-
-- **Auto-click**: Automatically clicks the "resume the conversation" link when rate limits appear
-- **Anti-spam**: 3-second cooldown between clicks to prevent issues
-
-## How to Use
-
-1. In Cursor, click "Help" in the menu bar and select "Toggle Developer Tools"
-2. Click the "Console" tab
-3. Copy the entire code from [cursor-auto-resume.js](cursor-auto-resume.js)
-4. Paste it into the console and press Enter
-5. Close DevTools by clicking the X in the corner (optional)
-
-The script will now automatically click the "resume the conversation" link whenever it appears.
-
-## How It Works
-
-The script:
-
-1. Monitors the page for specific rate limit messages
-2. When found, looks for the exact "resume the conversation" link
-3. Clicks the link automatically (with a 3-second cooldown)
-
-## FAQ
-
-### Is this safe to use?
-Yes, the script only runs in your Cursor IDE and only clicks the specific "resume the conversation" link when rate limits are hit. It doesn't modify any core functionality or bypass any security measures.
-
-### Will this work with future versions of Cursor?
-As long as Cursor continues to use similar rate limit messages and "resume the conversation" links, the script should continue to work. If Cursor's interface changes, we'll update the tool to maintain compatibility while respecting their service.
-
-### How do I disable it?
-Close and reopen Cursor IDE, or refresh the window.
-
-### Does this bypass Cursor's rate limits?
-No. This tool only automates clicking the "resume the conversation" link that Cursor explicitly provides. It respects all cooldown periods and doesn't bypass any actual API limits. It simply automates an action that users are already permitted to perform manually.
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a pull request. When contributing, please maintain the tool's core principle of respecting Cursor's service while helping developers be more productive.
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request 
+- **Public API**  
+  ```ts
+  window.CursorAutoHelper.start(silent?: boolean)
+  window.CursorAutoHelper.stop(silent?: boolean)
+  window.CursorAutoHelper.showToast(message: string, durationMs?: number)
+  window.CursorAutoHelper.setDebug(on: boolean)
+  window.CursorAutoHelper.clearAllIntervals()
