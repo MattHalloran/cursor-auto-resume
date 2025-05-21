@@ -1,17 +1,16 @@
 /* ======================================================================
- * CursorAutoHelper  –  v5.2  (2025-05-20)
+ * CursorAutoHelper  –  v5.4  (2025-05-21)
  * ----------------------------------------------------------------------
- *  · Auto-clicks “resume the conversation” banner (25-tool-call limit)
- *  · Auto-recovers from “Connection failed” banners & retry icons
- *  · Idle checker
- *        – Idle-START toast after 10 s
- *        – “Cycling in 30 s” warning (tab-strip outlined)
- *        – After 1 min of real inactivity ► cycle every chat tab
- *              · each tab outlined 3 s, clicked after 1 s, shown 15 s
- *  · Exponential back-off (1 s → … → 5 min) on retries
- *  · Always at most one toast on screen
- *  · Public API → window.CursorAutoHelper
- *      • start()  stop()  showToast()  setDebug()  clearAllIntervals()
+ *  · All automatic clicks are now limited to the detected conversation pane
+ *  · On load the pane is highlighted in magenta for 3 s
+ *  · If the pane cannot be found → red error toast and helper aborts
+ *  · Rest of the features exactly as in v5.3:
+ *        – Auto-click “resume the conversation” (25-tool-call)
+ *        – Auto-recover from connection errors (“Try again”, retry icon,
+ *          and the alternate single-button “Resume” banner)
+ *        – Idle checker ► tab cycler (abortable on real user input)
+ *        – Exponential back-off on retries
+ *        – Public API → window.CursorAutoHelper
  * ------------------------------------------------------------------- */
 
 (function bootstrap () {
@@ -19,54 +18,43 @@
   if (window[KEY]?.stop) window[KEY].stop(true);   // unload old copy
 
   /* ────────────────────────── CONFIG ────────────────────────── */
-  /** Time (ms) before cycling starts after last real user action. */
   const IDLE_TIMEOUT         = 60_000;
-  /** First idle-notice toast delay (ms). */
   const IDLE_START_NOTICE    = 10_000;
-  /** “Cycling in …” warning appears this many ms before cycling. */
   const CYCLE_WARNING_BEFORE = 30_000;
-  /** How long (ms) to keep each tab open during cycling. */
   const TAB_DELAY            = 15_000;
-  /** Idle-watcher polling interval (ms). */
   const IDLE_CHECK_INTERVAL  = 10_000;
 
   /* ────────────────────────── STATE ─────────────────────────── */
-  let intervals          = [];
-  let retryDelay         = 1_000;
-  let nextRetryAfter     = 0;
-  let lastResumeClick    = 0;
-  let debugAlerts        = false;
-  let resumeBusy         = false;
-  let retryBusy          = false;
+  let conversationPane  = null;   // will hold the pane element
+  let intervals         = [];
+  let retryDelay        = 1_000;
+  let nextRetryAfter    = 0;
+  let lastResumeClick   = 0;
+  let debugAlerts       = false;
+  let resumeBusy        = false;
+  let retryBusy         = false;
+  let resumeConnBusy    = false;
 
-  let lastUserActivity   = Date.now();
-  let isCyclingTabs      = false;
-  let idleToastShown     = false;
+  let lastUserActivity  = Date.now();
+  let idleToastShown    = false;
   let preCycleToastShown = false;
 
-  let currentToast       = null;
-  let currentToastTimer  = null;
+  const cycleCtl = { active: false, cancel: () => {} };
+
+  let currentToast = null;
+  let currentToastTimer = null;
 
   /* ────────────────────────── HELPERS ───────────────────────── */
 
-  /**
-   * Write to console only when debug is enabled.
-   * @param {...unknown} args – anything to log
-   */
   const log = (...args) => { if (debugAlerts) console.log('[CAH]', ...args); };
 
-  /**
-   * Display a toast message, ensuring only one toast is visible at a time.
-   * @param {string} msg – text content
-   * @param {number} [ms=8000] – time before auto-dismiss (ms)
-   */
-  function showToast (msg, ms = 8000) {
+  function showToast (msg, ms = 8000, color = '#333') {
     if (currentToast) { clearTimeout(currentToastTimer); currentToast.remove(); }
     const div = Object.assign(document.createElement('div'), {
       textContent : msg,
       style : `
         position:fixed;bottom:12px;right:12px;z-index:2147483647;
-        background:#333;color:#fff;padding:8px;border-radius:4px;
+        background:${color};color:#fff;padding:8px 10px;border-radius:4px;
         font:14px/1.3 monospace;opacity:.92;pointer-events:none;`
     });
     document.body.appendChild(div);
@@ -74,79 +62,97 @@
     currentToastTimer = setTimeout(() => { div.remove(); currentToast = null; }, ms);
   }
 
-  /**
-   * Add a temporary magenta outline to an element.
-   * @param {Element|null} el – element to outline
-   * @param {number} [duration=3000] – outline duration (ms)
-   */
-  function highlightElement (el, duration = 3000) {
-    if (!el || !(el instanceof HTMLElement)) return;
-    const prev = el.style.outline;
-    el.style.outline = '3px solid magenta';
-    setTimeout(() => { if (document.contains(el)) el.style.outline = prev || ''; }, duration);
-  }
+/**
+ * Visually highlight any element for `duration` ms – guaranteed visible.
+ * Works even if the target has overflow:hidden or complex stacking.
+ *
+ * @param {Element|null} el
+ * @param {number} [duration=3000]
+ */
+function highlightElement(el, duration = 3000) {
+  if (!el || !(el instanceof HTMLElement)) return;
 
-  /**
-   * Outline `el`, wait `before` ms, click it, keep outline `dur` ms total.
-   * Executes `onDone` after outline removal.
-   * @param {HTMLElement} el
-   * @param {() => void} clickFn
-   * @param {number} [before=1000] – delay before click (ms)
-   * @param {number} [dur=3000] – total outline time (ms)
-   * @param {() => void} [onDone] – callback when complete
-   */
-  function previewAndClick (
-    el, clickFn, before = 1000, dur = 3000, onDone = () => {}
-  ) {
-    if (!el || !el.offsetParent) { onDone(); return; }
+  // Get target’s bounding box relative to the viewport
+  const rect = el.getBoundingClientRect();
+  const overlay = Object.assign(document.createElement('div'), {
+    style: `
+      position: fixed;
+      top: ${rect.top}px;
+      left: ${rect.left}px;
+      width: ${rect.width}px;
+      height: ${rect.height}px;
+      border: 3px solid magenta;
+      border-radius: 2px;
+      pointer-events: none;
+      z-index: 2147483647;          /* on top of everything */
+      box-sizing: border-box;
+      animation: cah-pulse 0.6s linear infinite;
+    `
+  });
+
+  // Simple pulse so it’s harder to miss
+  const styleTag = document.getElementById('cah-pulse-style') ??
+    Object.assign(document.createElement('style'), {
+      id: 'cah-pulse-style',
+      textContent: `
+        @keyframes cah-pulse {
+          0%   { opacity: 1; }
+          50%  { opacity: 0.4; }
+          100% { opacity: 1; }
+        }
+      `
+    });
+  if (!styleTag.isConnected) document.head.appendChild(styleTag);
+
+  document.body.appendChild(overlay);
+  setTimeout(() => overlay.remove(), duration);
+}
+
+  function previewAndClick (el, clickFn, before = 1000, dur = 3000) {
+    if (!el || !el.offsetParent) return [];
     const prev = el.style.outline;
     el.style.outline = '3px solid magenta';
-    setTimeout(() => { clickFn(); }, before);
-    setTimeout(() => {
+    const t1 = setTimeout(() => { clickFn(); }, before);
+    const t2 = setTimeout(() => {
       if (document.contains(el)) el.style.outline = prev || '';
-      onDone();
     }, dur);
+    return [t1, t2];
   }
 
-  /**
-   * Return the chat’s UL.tablist
-   * @returns {HTMLUListElement|null}
-   */
-   function findChatTabList() {
-     // grab only visible tablists
-    const lists = Array.from(
-      document.querySelectorAll('ul.actions-container[role="tablist"]')
-    ).filter(el => el.offsetParent !== null);
+  /* ───────────── CONVERSATION PANE DETECTION ───────────── */
 
-    // pick the one whose any ancestor has class="right pane-composite-part"
-    for (const ul of lists) {
-      if (ul.closest('.right.pane-composite-part')) {
-        return ul;
-      }
-    }
+  /** Tries several heuristics to locate the conversation pane. */
+  function findConversationPane () {
+    // 1) Look for a visible UL.tablist and walk up to its composite part
+    const ul = Array.from(
+      document.querySelectorAll('ul.actions-container[role="tablist"]')
+    ).find(el =>
+      el.offsetParent !== null && el.closest('.right.pane-composite-part')
+    );
+    if (ul) return ul.closest('.right.pane-composite-part');
+
+    // 2) Common class name used by Cursor
+    const convo = document.querySelector('.conversations');
+    if (convo && convo.offsetParent) return convo;
+
+    // 3) ARIA label (fallback)
+    const aria = document.querySelector('[aria-label="Conversations"]');
+    if (aria && aria.offsetParent) return aria;
 
     return null;
   }
 
-  /**
-   * Whether an element is visible in the layout flow.
-   * @param {Element|null} el
-   * @returns {boolean}
-   */
-  function isVisible (el) {
-    return !!(el instanceof HTMLElement && el.offsetParent);
-  }
+  /** All queries are scoped to the pane once it exists. */
+  const qAll   = sel => conversationPane ? conversationPane.querySelectorAll(sel) : [];
+  const qFirst = sel => conversationPane ? conversationPane.querySelector(sel)    : null;
+  const isVisible = el => !!(el instanceof HTMLElement && el.offsetParent);
 
   /* ───────────── 1. “Resume conversation” WATCHER ───────────── */
 
-  /**
-   * Clicks the “resume the conversation” link in the 25-tool-call banner.
-   * Runs once per second and uses a 3 s cooldown.
-   */
   function resumeWatcher () {
-    if (resumeBusy || Date.now() - lastResumeClick < 3000) return;
+    if (!conversationPane || resumeBusy || Date.now() - lastResumeClick < 3000) return;
 
-    for (const el of document.querySelectorAll('body *')) {
+    for (const el of qAll('*')) {
       if (!el.textContent ||
           (!el.textContent.includes('stop the agent after 25 tool calls') &&
            !el.textContent.includes('Note: we default stop'))) continue;
@@ -159,38 +165,29 @@
         resumeBusy = true;
         previewAndClick(
           link,
-          () => { link.click(); lastResumeClick = Date.now(); showToast('🟢 Resumed conversation'); },
-          1000, 3000,
-          () => { resumeBusy = false; }
+          () => { link.click(); lastResumeClick = Date.now(); showToast('🟢 Resumed conversation'); }
         );
+        setTimeout(() => { resumeBusy = false; }, 3100);
         break;
       }
     }
   }
 
-  /* ───────────── 2. “Connection failed” WATCHER ───────────── */
+  /* ───────────── 2. CONNECTION WATCHERS ───────────── */
 
-  /**
-   * Detects “Connection failed.” banner and retries with exponential back-off.
-   * Looks for either a visible “Try again” button or the last retry icon.
-   */
   function retryWatcher () {
-    if (retryBusy || Date.now() < nextRetryAfter) return;
+    if (!conversationPane || retryBusy || Date.now() < nextRetryAfter) return;
 
-    const failSpan = Array.from(document.querySelectorAll('span'))
+    const failSpan = Array.from(qAll('span'))
       .find(s => s.textContent.trim().startsWith('Connection failed.'));
 
     if (!failSpan) { retryDelay = 1_000; nextRetryAfter = 0; return; }
 
     const banner = failSpan.closest('div') || failSpan;
-    const tryBtn = Array.from(banner.querySelectorAll('button,[role="button"],a,span'))
-      .find(el => /try again/i.test(el.textContent) && isVisible(el));
+    const tryBtn = Array.from(
+      banner.querySelectorAll('button,[role="button"],a,span')
+    ).find(el => /try again/i.test(el.textContent) && isVisible(el));
 
-    /**
-     * Click `node`, show toast, update back-off timers.
-     * @param {HTMLElement} node
-     * @param {string} label
-     */
     const clickAndBackoff = (node, label) => {
       node.click();
       nextRetryAfter = Date.now() + retryDelay;
@@ -201,69 +198,97 @@
     retryBusy = true;
 
     if (tryBtn) {
-      previewAndClick(tryBtn, () => clickAndBackoff(tryBtn, 'Clicked “Try again”'),
-                      1000, 3000, () => { retryBusy = false; });
+      previewAndClick(
+        tryBtn, () => clickAndBackoff(tryBtn, 'Clicked “Try again”')
+      );
+      setTimeout(() => { retryBusy = false; }, 3100);
       return;
     }
 
-    const iconBtn = Array.from(document.querySelectorAll('div.anysphere-icon-button'))
+    const iconBtn = Array.from(qAll('div.anysphere-icon-button'))
       .filter(btn => isVisible(btn) && !btn.closest('.full-input-box'))
       .at(-1);
 
     if (iconBtn) {
-      previewAndClick(iconBtn, () => clickAndBackoff(iconBtn, 'Retried via icon'),
-                      1000, 3000, () => { retryBusy = false; });
+      previewAndClick(
+        iconBtn, () => clickAndBackoff(iconBtn, 'Retried via icon')
+      );
+      setTimeout(() => { retryBusy = false; }, 3100);
       return;
     }
 
     retryBusy = false;
   }
 
+  function resumeConnWatcher () {
+    if (!conversationPane || resumeConnBusy || Date.now() < nextRetryAfter) return;
+
+    const resumeBtn = Array.from(qAll('button,[role="button"],a,span'))
+      .find(el => el.textContent.trim().toLowerCase() === 'resume' && isVisible(el));
+
+    if (!resumeBtn) return;
+
+    resumeConnBusy = true;
+    previewAndClick(
+      resumeBtn,
+      () => {
+        resumeBtn.click();
+        nextRetryAfter = Date.now() + retryDelay;
+        retryDelay = Math.min(retryDelay * 2, 5 * 60_000);
+        showToast(`🔌 Pressed “Resume” (next ${retryDelay / 1000}s)`);
+      }
+    );
+    setTimeout(() => { resumeConnBusy = false; }, 3100);
+  }
+
   /* ───────────── 3. IDLE WATCHER & TAB CYCLER ─────────────── */
 
-  /** User-generated events that count as “activity.” */
   const USER_EVENTS = ['mousedown', 'keydown', 'wheel', 'touchstart', 'pointerdown'];
 
   USER_EVENTS.forEach(evt =>
     window.addEventListener(evt, ev => {
-      if (!ev.isTrusted) return;               // ignore synthetic clicks
+      if (!ev.isTrusted) return;
       lastUserActivity = Date.now();
+      if (cycleCtl.active) { cycleCtl.cancel(); showToast('⛔ Cycle cancelled by user'); }
       if (idleToastShown || preCycleToastShown) showToast('🔄 Idle countdown reset');
       idleToastShown = preCycleToastShown = false;
     }, { passive: true })
   );
 
-  /**
-   * Sequentially switch through `tabs`, keeping each open `TAB_DELAY` ms.
-   * @param {HTMLElement[]} tabs
-   */
+  function findChatTabList () {
+    return conversationPane
+      ? conversationPane.querySelector('ul.actions-container[role="tablist"]')
+      : null;
+  }
+
   function cycleTabs (tabs) {
+    cycleCtl.active = true;
     let idx = 0;
+    let timers = [];
+
+    cycleCtl.cancel = () => { timers.forEach(clearTimeout); timers = []; cycleCtl.active = false; };
+
     const next = () => {
+      if (!cycleCtl.active) return;
       if (idx >= tabs.length) {
         showToast('🔄 Idle tab cycle complete');
+        cycleCtl.active = false;
         lastUserActivity = Date.now();
-        isCyclingTabs = false;
         return;
       }
       const tab = tabs[idx++];
       const label = tab.textContent.trim() || `Tab ${idx}`;
       showToast(`📂 ${label}`);
-      previewAndClick(
-        tab,
-        () => tab.click(),
-        1000, 3000,
-        () => setTimeout(next, TAB_DELAY)
+      const [tClick, tOutline] = previewAndClick(
+        tab, () => { if (cycleCtl.active) tab.click(); }
       );
+      timers.push(tClick, tOutline, setTimeout(next, TAB_DELAY));
     };
     next();
   }
 
-  /**
-   * Periodic checker that starts tab-cycling after `IDLE_TIMEOUT` ms.
-   */
   function idleWatcher () {
-    if (isCyclingTabs) return;
+    if (cycleCtl.active || !conversationPane) return;
     const idleFor = Date.now() - lastUserActivity;
 
     if (!idleToastShown && idleFor >= IDLE_START_NOTICE) {
@@ -286,7 +311,6 @@
     const tabs = Array.from(ul.querySelectorAll('li')).filter(isVisible);
     if (!tabs.length) return;
 
-    isCyclingTabs = true;
     idleToastShown = preCycleToastShown = false;
     showToast(`🔄 Idle detected – cycling ${tabs.length} tab${tabs.length > 1 ? 's' : ''}`);
     highlightElement(ul, 3000);
@@ -295,34 +319,25 @@
 
   /* ──────────────────── PUBLIC API & BOOTSTRAP ─────────────────── */
 
-  /**
-   * Start all watchers (called automatically on load).
-   * @param {boolean} [silent=false] – suppress initial toast
-   */
   function start (silent = false) {
     stop(true);
-    intervals.push(setInterval(resumeWatcher, 1000));
-    intervals.push(setInterval(retryWatcher , 1000));
-    intervals.push(setInterval(idleWatcher  , IDLE_CHECK_INTERVAL));
-    resumeWatcher(); retryWatcher(); idleWatcher();
+    intervals.push(setInterval(resumeWatcher     , 1000));
+    intervals.push(setInterval(retryWatcher      , 1000));
+    intervals.push(setInterval(resumeConnWatcher , 1000));
+    intervals.push(setInterval(idleWatcher       , IDLE_CHECK_INTERVAL));
+    resumeWatcher(); retryWatcher(); resumeConnWatcher(); idleWatcher();
     if (!silent) showToast('🚀 CursorAutoHelper started');
   }
 
-  /**
-   * Stop all watchers, clear timers, reset state.
-   * @param {boolean} [silent=false] – suppress toast
-   */
   function stop (silent = false) {
     intervals.forEach(clearInterval); intervals.length = 0;
-    retryBusy = resumeBusy = isCyclingTabs = false;
+    retryBusy = resumeBusy = resumeConnBusy = false;
     retryDelay = 1_000; nextRetryAfter = lastResumeClick = 0;
     idleToastShown = preCycleToastShown = false;
+    if (cycleCtl.active) cycleCtl.cancel();
     if (!silent) showToast('🛑 CursorAutoHelper stopped');
   }
 
-  /**
-   * Extremist debug helper – clears *every* setInterval on the page.
-   */
   function clearAllIntervals () {
     const max = setInterval(() => {}, 9999);
     for (let i = max; i >= 0; --i) clearInterval(i);
@@ -330,17 +345,21 @@
     alert('💥 All intervals cleared – reload or paste helper again.');
   }
 
-  /**
-   * Enable or disable debug logging.
-   * @param {boolean} on
-   */
   function setDebug (on) {
     debugAlerts = !!on;
     alert('Debug ' + (debugAlerts ? 'ENABLED' : 'disabled'));
   }
 
-  /* Export & launch */
+  /* ────────────────────────── INITIALISE ───────────────────────── */
+
+  conversationPane = findConversationPane();
+  if (!conversationPane) {
+    showToast('🚨 Conversation pane not found – helper disabled', 12000, '#c01');
+    return;          // nothing else runs
+  }
+
+  highlightElement(conversationPane, 3000);
   window[KEY] = { start, stop, showToast, setDebug, clearAllIntervals };
   start(true);
-  showToast('🔧 CursorAutoHelper v5.2 loaded');
+  showToast('🔧 CursorAutoHelper v5.4 loaded');
 })();
